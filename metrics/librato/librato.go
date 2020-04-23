@@ -43,18 +43,51 @@ type Librato struct {
 	counters              *lv.Space
 	gauges                *lv.Space
 	histograms            *lv.Space
-	averages              *lv.Space
+	sums                  *lv.Space
 	percentiles           []float64 // percentiles to track
 	logger                log.Logger
 	numConcurrentRequests int
 	maxBatchSize          int
 }
 
+// GaugePayload payload for librato gauge:
+// http://api-docs-archive.librato.com/#gauge-specific-parameters
+type GaugePayload struct {
+	*Metric
+	Count      *int     `json:"count,omitempty"`
+	Sum        *float64 `json:"sum,omitempty"`
+	Max        *float64 `json:"max,omitempty"`
+	Min        *float64 `json:"min,omitempty"`
+	SumSquares *float64 `json:"sum_squares,omitempty"`
+}
+
+// CounterPayload wraps Metric
+type CounterPayload Metric
+
+// RequestPayload represents payload for http://api-docs-archive.librato.com/#create-a-metric
+type RequestPayload struct {
+	MeasureTime *int64           `json:"measure_time,omitempty"`
+	Source      *int             `json:"source,omitempty"`
+	Gauges      []GaugePayload   `json:"gauges,omitempty"`
+	Counters    []CounterPayload `json:"counters,omitempty"`
+}
+
+// Size reports amount of metrics in this request
+func (r *RequestPayload) Size() int {
+	if r == nil {
+		return 0
+	}
+
+	return len(r.Gauges) + len(r.Counters)
+}
+
+// Metric represents Librato Metric payload
+// http://api-docs-archive.librato.com/#measurement-parameters
 type Metric struct {
-	MeasureTime *int64  `json:"measure_time"`
-	Name        string  `json:"name"`
-	Value       float64 `json:"value"`
-	Source      *string `json:"string"`
+	MeasureTime *int64   `json:"measure_time,omitempty"`
+	Name        string   `json:"name"`
+	Value       *float64 `json:"value,omitempty"`
+	Source      *string  `json:"string,omitempty"`
 }
 
 type Option func(*Librato)
@@ -127,7 +160,7 @@ func New(user, token string, options ...Option) *Librato {
 		counters:              lv.NewSpace(),
 		gauges:                lv.NewSpace(),
 		histograms:            lv.NewSpace(),
-		averages:              lv.NewSpace(),
+		sums:                  lv.NewSpace(),
 		logger:                log.NewLogfmtLogger(os.Stderr),
 		percentiles:           []float64{0.50, 0.90, 0.95, 0.99},
 		numConcurrentRequests: maxConcurrentRequests,
@@ -152,21 +185,23 @@ func (lb *Librato) NewCounter(name string) metrics.Counter {
 	}
 }
 
-// NewGauge returns an gauge.
+// NewGauge returns an gauge, which will calculate count, sum, min, max
+// of observed data before sending it to librato
 func (lb *Librato) NewGauge(name string) metrics.Gauge {
 	return &Gauge{
 		name: name,
 		obs:  lb.gauges.Observe,
-		add:  lb.gauges.Add,
+		add:  lb.gauges.Observe,
 	}
 }
 
-// NewAvgGauge returns Gauge which will calculate average of submitted values
+// NewSumGauge returns Gauge which will calculate sum of submitted values
 // before sending them to librato
-func (lb *Librato) NewAvgGauge(name string) metrics.Histogram {
-	return &Histogram{
+func (lb *Librato) NewSumGauge(name string) metrics.Gauge {
+	return &Gauge{
 		name: name,
-		obs:  lb.averages.Observe,
+		obs:  lb.sums.Add,
+		add:  lb.sums.Add,
 	}
 }
 
@@ -202,30 +237,52 @@ func (lb *Librato) Send() error {
 	defer lb.mtx.RUnlock()
 	now := time.Now().Unix()
 
-	var batches []map[string][]Metric
-	datums := map[string][]Metric{}
-
-	add := func(typ string, m Metric) {
-		count := 0
-		for _, v := range datums {
-			count += len(v)
-		}
-		if count >= lb.maxBatchSize {
-			batches = append(batches, datums)
-			datums = map[string][]Metric{}
-		}
-
-		datums[typ] = append(datums[typ], m)
+	var batches []*RequestPayload
+	datums := &RequestPayload{
+		MeasureTime: &now,
 	}
-	addCounter := func(m Metric) { add("counters", m) }
-	addGauge := func(m Metric) { add("gauges", m) }
+
+	add := func(m interface{}) {
+		// batch into multiple requests if we got
+		// more then max size
+		if datums.Size() >= lb.maxBatchSize {
+			batches = append(batches, datums)
+			datums = &RequestPayload{
+				MeasureTime: &now,
+			}
+		}
+
+		switch v := m.(type) {
+		case CounterPayload:
+			datums.Counters = append(datums.Counters, v)
+		case GaugePayload:
+			datums.Gauges = append(datums.Gauges, v)
+		case Metric:
+			datums.Gauges = append(datums.Gauges, GaugePayload{Metric: &v})
+		default:
+			lb.logger.Log("err", "unknown metric type")
+		}
+	}
 
 	lb.counters.Reset().Walk(func(name string, lvs lv.LabelValues, values []float64) bool {
-		addCounter(Metric{
-			Value:       sum(values),
-			MeasureTime: &now,
-			Name:        name,
-			Source:      getSourceFromLabels(lvs),
+		sum := sum(values)
+		add(CounterPayload{
+			Value:  &sum,
+			Name:   name,
+			Source: getSourceFromLabels(lvs),
+		})
+		return true
+	})
+
+	lb.sums.Reset().Walk(func(name string, lvs lv.LabelValues, values []float64) bool {
+		// last value will allways be the sum
+		sum := last(values)
+		add(GaugePayload{
+			Metric: &Metric{
+				Value:  &sum,
+				Name:   name,
+				Source: getSourceFromLabels(lvs),
+			},
 		})
 		return true
 	})
@@ -234,15 +291,36 @@ func (lb *Librato) Send() error {
 		if len(values) == 0 {
 			return true
 		}
-
-		for _, v := range values {
-			addGauge(Metric{
-				Value:       v,
-				MeasureTime: &now,
-				Name:        name,
-				Source:      getSourceFromLabels(lvs),
-			})
+		v := last(values)
+		g := GaugePayload{
+			Metric: &Metric{
+				Name:   name,
+				Source: getSourceFromLabels(lvs),
+			},
 		}
+
+		if l := len(values); l == 1 {
+			g.Value = &v
+		} else {
+			g.Count = &l
+			g.Sum = f64Ptr(0)
+			g.Min = &v
+			g.Max = f64Ptr(0)
+			g.SumSquares = f64Ptr(0)
+			for _, val := range values {
+				*g.Sum += val
+				*g.SumSquares += val * val
+				if val > *g.Max {
+					*g.Max = val
+				}
+
+				if val < *g.Min {
+					*g.Min = val
+				}
+			}
+		}
+
+		add(g)
 
 		return true
 	})
@@ -264,41 +342,23 @@ func (lb *Librato) Send() error {
 
 		for _, perc := range lb.percentiles {
 			value := histogram.Quantile(perc)
-			addGauge(Metric{
-				Value:       value,
-				MeasureTime: &now,
-				Name:        fmt.Sprintf("%s_%s", name, formatPerc(perc)),
-				Source:      getSourceFromLabels(lvs),
+			add(GaugePayload{
+				Metric: &Metric{
+					Value:       &value,
+					MeasureTime: &now,
+					Name:        fmt.Sprintf("%s_%s", name, formatPerc(perc)),
+					Source:      getSourceFromLabels(lvs),
+				},
 			})
 		}
 		return true
 	})
 
-	lb.averages.Reset().Walk(func(name string, lvs lv.LabelValues, values []float64) bool {
-		avg := generic.NewSimpleHistogram()
-		for _, v := range values {
-			avg.Observe(v)
-		}
-
-		addGauge(Metric{
-			Value:       avg.ApproximateMovingAverage(),
-			MeasureTime: &now,
-			Name:        name,
-			Source:      getSourceFromLabels(lvs),
-		})
-		return true
-	})
-
 	batches = append(batches, datums)
 
-	c := 0
 	var errors = make(chan error, len(batches))
 	for _, batch := range batches {
-
-		for _, v := range batch {
-			c += len(v)
-		}
-		go func(batch map[string][]Metric) {
+		go func(batch *RequestPayload) {
 			lb.sem <- struct{}{}
 			defer func() {
 				<-lb.sem
@@ -318,7 +378,7 @@ func (lb *Librato) Send() error {
 	return firstErr
 }
 
-func (lb *Librato) postMetric(body map[string][]Metric) error {
+func (lb *Librato) postMetric(body *RequestPayload) error {
 	b, err := json.Marshal(body)
 	if nil != err {
 		return err
@@ -396,7 +456,9 @@ func (c *Counter) Add(delta float64) {
 }
 
 // Gauge is a gauge. Observations are forwarded to a node
-// object, and aggregated (the last observation selected) per timeseries.
+// object, and aggregated as sum, count, min, max for librato statistics
+// Add and Set methods are doing the same - adding metrics
+// to the timeseries
 type Gauge struct {
 	name string
 	lvs  lv.LabelValues
@@ -455,4 +517,8 @@ func getSourceFromLabels(lvs lv.LabelValues) *string {
 		}
 	}
 	return nil
+}
+
+func f64Ptr(v float64) *float64 {
+	return &v
 }

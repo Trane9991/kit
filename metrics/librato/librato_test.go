@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync"
@@ -24,7 +25,7 @@ const (
 
 type mockLibrato struct {
 	*Librato
-	valuesReceived map[string][]Metric
+	valuesReceived *RequestPayload
 	mtx            sync.RWMutex
 }
 
@@ -36,8 +37,9 @@ func (s roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func newMockLibrato() *mockLibrato {
 	ml := &mockLibrato{
-		valuesReceived: map[string][]Metric{},
+		valuesReceived: &RequestPayload{},
 	}
+
 	c := &http.Client{
 		Timeout: 5 * time.Second,
 		// mock HTTP Roundtrip to intercept what was send
@@ -50,30 +52,29 @@ func newMockLibrato() *mockLibrato {
 				return nil, err
 			}
 
-			vals := map[string][]Metric{}
+			vals := RequestPayload{}
 			if err := json.Unmarshal(b, &vals); err != nil {
 				return nil, err
 			}
 
-			if len(vals) > 0 {
+			if vals.Size() > 0 {
 				ml.mtx.Lock()
 				defer ml.mtx.Unlock()
-				for k, v := range vals {
 
-					for _, vv := range v {
-						// artificially generated errors
-						switch vv.Name {
-						case metricNameToGenerateError:
-							return nil, errors.New("tcp timeout")
-						case metricNameToGenerateInternalError:
-							return &http.Response{
-								StatusCode: http.StatusInternalServerError,
-								Body:       ioutil.NopCloser(bytes.NewReader([]byte("Internal Server Error!"))),
-							}, nil
-						}
+				ml.valuesReceived.Counters = append(ml.valuesReceived.Counters, vals.Counters...)
+				ml.valuesReceived.Gauges = append(ml.valuesReceived.Gauges, vals.Gauges...)
+
+				// check for fake errors
+				for _, vv := range ml.valuesReceived.Gauges {
+					switch vv.Name {
+					case metricNameToGenerateError:
+						return nil, errors.New("tcp timeout")
+					case metricNameToGenerateInternalError:
+						return &http.Response{
+							StatusCode: http.StatusInternalServerError,
+							Body:       ioutil.NopCloser(bytes.NewReader([]byte("Internal Server Error!"))),
+						}, nil
 					}
-
-					ml.valuesReceived[k] = append(ml.valuesReceived[k], v...)
 				}
 
 			}
@@ -99,15 +100,15 @@ func TestCounter(t *testing.T) {
 		}
 		lb.mtx.RLock()
 		defer lb.mtx.RUnlock()
-		c := lb.valuesReceived["counters"]
-		defer delete(lb.valuesReceived, "counters")
+		c := lb.valuesReceived.Counters
+		lb.valuesReceived.Counters = nil
 
 		if l := len(c); l != 1 {
 			t.Errorf("One counter expected, got %d", l)
 			return 0
 		}
 
-		return c[0].Value
+		return *c[0].Value
 	}
 	if err := teststat.TestCounter(counter, valuef); err != nil {
 		t.Fatal(err)
@@ -139,7 +140,7 @@ func TestCounterLowSendConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metrics := lb.valuesReceived["counters"]
+	metrics := lb.valuesReceived.Counters
 	if len(metrics) != len(names) {
 		t.Fatalf("Expected %d metrics, but got %d", len(names), len(metrics))
 	}
@@ -159,8 +160,8 @@ func TestCounterLowSendConcurrency(t *testing.T) {
 
 	for i, name := range names {
 		m := metrics[i]
-		if m.Name != name || m.Value != wants[i] {
-			t.Errorf("Expected metric %s=%f, got %s=%f", name, wants[i], m.Name, m.Value)
+		if m.Name != name || m.Value == nil || *m.Value != wants[i] {
+			t.Errorf("Expected metric %s=%f, got %s=%v", name, wants[i], m.Name, m.Value)
 		}
 	}
 }
@@ -181,13 +182,13 @@ func TestAggregatedCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metrics := lb.valuesReceived["counters"]
+	metrics := lb.valuesReceived.Counters
 	if len(metrics) != 1 {
 		t.Fatalf("Expected 1 metrics, but got %d", len(metrics))
 	}
 
-	if m := metrics[0]; m.Value != want {
-		t.Fatalf("Expected value of %f, but got %f", want, m.Value)
+	if m := metrics[0]; m.Value == nil || *m.Value != want {
+		t.Fatalf("Expected value of %f, but got %v", want, m.Value)
 	}
 }
 
@@ -207,7 +208,7 @@ func TestCounterWithDifferentLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metrics := lb.valuesReceived["counters"]
+	metrics := lb.valuesReceived.Counters
 	if len(metrics) != count {
 		t.Fatalf("Expected %d metric, but got %d", count, len(metrics))
 	}
@@ -228,38 +229,9 @@ func TestCounterWithDifferentLabels(t *testing.T) {
 	for i, v := range wants {
 		m := metrics[i]
 		lbl := strconv.Itoa(i + 1)
-		if m.Value != v || *m.Source != lbl {
-			t.Errorf("Expected metric source(%s)=%f, got source(%s)=%f", *m.Source, v, lbl, m.Value)
+		if m.Value == nil || *m.Value != v || *m.Source != lbl {
+			t.Errorf("Expected metric source(%s)=%f, got source(%s)=%v", *m.Source, v, lbl, m.Value)
 		}
-	}
-}
-
-func TestGauge(t *testing.T) {
-	name := "def"
-	labels := []string{"source", "label"}
-	lb := newMockLibrato()
-
-	gauge := lb.NewGauge(name).With(labels...)
-	valuef := func() []float64 {
-		if err := lb.Send(); err != nil {
-			t.Fatal(err)
-		}
-		lb.mtx.RLock()
-		defer lb.mtx.RUnlock()
-
-		values := []float64{}
-		for _, m := range lb.valuesReceived["gauges"] {
-			if m.Name != name {
-				t.Errorf("Unexpected metric name %s", m.Name)
-			}
-			values = append(values, m.Value)
-		}
-
-		return values
-	}
-
-	if err := teststat.TestGauge(gauge, valuef); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -280,22 +252,22 @@ func TestHistogram(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		metrics := lb.valuesReceived["gauges"]
+		metrics := lb.valuesReceived.Gauges
 		lb.mtx.RLock()
 		defer lb.mtx.RUnlock()
 
 		for _, m := range metrics {
 			if m.Name == n50 {
-				p50 = m.Value
+				p50 = *m.Value
 			}
 			if m.Name == n90 {
-				p90 = m.Value
+				p90 = *m.Value
 			}
 			if m.Name == n95 {
-				p95 = m.Value
+				p95 = *m.Value
 			}
 			if m.Name == n99 {
-				p99 = m.Value
+				p99 = *m.Value
 			}
 		}
 		return
@@ -325,13 +297,13 @@ func TestHistogram(t *testing.T) {
 		p95 = 541.121341
 		p99 = 558.158697
 
-		metrics := lb.valuesReceived["gauges"]
+		metrics := lb.valuesReceived.Gauges
 		for _, m := range metrics {
 			if m.Name == n50 {
-				p50 = m.Value
+				p50 = *m.Value
 			}
 			if m.Name == n90 {
-				p90 = m.Value
+				p90 = *m.Value
 			}
 
 			// but fail if they are actually set (because that would mean the
@@ -351,35 +323,70 @@ func TestHistogram(t *testing.T) {
 	}
 }
 
-func TestAvgHistorgram(t *testing.T) {
-	name := "avg_hist"
+func TestGauge(t *testing.T) {
+	name := t.Name()
 	lb := newMockLibrato()
-
-	avg := lb.NewAvgGauge(name).With("source", "test")
+	labels := []string{"source", "test"}
+	avg := lb.NewGauge(name).With(labels...)
 	count := 45
 
-	var want float64
+	var sum, sumSquares float64
 
-	for i := 1; i <= count; i++ {
-		v := float64(i)
-		want += v
-		avg.Observe(v)
+	min := float64(1)
+	max := float64(count)
+	for v := min; v <= max; v++ {
+		sum += v
+		sumSquares += v * v
+		avg.Add(v)
 	}
-
-	want /= float64(count)
 
 	if err := lb.Send(); err != nil {
 		t.Fatal(err)
 	}
 
-	metrics := lb.valuesReceived["gauges"]
+	metrics := lb.valuesReceived.Gauges
 	if len(metrics) != 1 {
 		t.Fatalf("Expected 1 metrics, but got %d", len(metrics))
 	}
 
-	if m := metrics[0]; m.Value != want {
-		t.Fatalf("Expected value of %f, but got %f", want, m.Value)
+	want := GaugePayload{
+		Metric: &Metric{
+			Name:   name,
+			Source: &labels[1],
+		},
+		Count:      &count,
+		Min:        &min,
+		Max:        &max,
+		Sum:        &sum,
+		SumSquares: &sumSquares,
 	}
+
+	if m := metrics[0]; !reflect.DeepEqual(m, want) {
+		t.Fatalf("Expected\nvalue=nil, sum=%f, count=%d, max=%f, min=%f,\nbut got\nvalue=%v, sum=%v, count=%v, max=%v, min=%v",
+			sum, count, max, min, m.Value, m.Sum, m.Count, m.Max, m.Min)
+	}
+}
+
+func TestOneGauge(t *testing.T) {
+	name := t.Name()
+	labels := []string{"source", "label"}
+	lb := newMockLibrato()
+	v := 1.0
+	lb.NewGauge(name).With(labels...).Add(v)
+
+	if err := lb.Send(); err != nil {
+		t.Fatal(err)
+	}
+
+	metrics := lb.valuesReceived.Gauges
+	if len(metrics) != 1 {
+		t.Fatalf("Expected 1 metrics, but got %d", len(metrics))
+	}
+
+	if m := metrics[0]; m.Value == nil || *m.Value != v {
+		t.Fatalf("Expected value=%f but got value=%v", v, m.Value)
+	}
+
 }
 
 func TestMetricsBatching(t *testing.T) {
@@ -403,7 +410,7 @@ func TestMetricsBatching(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metrics := lb.valuesReceived["counters"]
+	metrics := lb.valuesReceived.Counters
 	if len(metrics) != len(names) {
 		t.Fatalf("Expected %d metrics, but got %d", len(names), len(metrics))
 	}
@@ -423,8 +430,8 @@ func TestMetricsBatching(t *testing.T) {
 
 	for i, name := range names {
 		m := metrics[i]
-		if m.Name != name || m.Value != wants[i] {
-			t.Errorf("Expected metric %s=%f, got %s=%f", name, wants[i], m.Name, m.Value)
+		if m.Name != name || m.Value == nil || *m.Value != wants[i] {
+			t.Errorf("Expected metric %s=%f, got %s=%v", name, wants[i], m.Name, m.Value)
 		}
 	}
 }
@@ -433,7 +440,7 @@ func TestSumGauge(t *testing.T) {
 	name := "sum_gauge"
 	lb := newMockLibrato()
 
-	g := lb.NewGauge(name).With("source", "test")
+	g := lb.NewSumGauge(name).With("source", "test")
 	count := 45
 
 	var want float64
@@ -448,13 +455,13 @@ func TestSumGauge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metrics := lb.valuesReceived["gauges"]
+	metrics := lb.valuesReceived.Gauges
 	if len(metrics) != 1 {
 		t.Fatalf("Expected 1 metrics, but got %d", len(metrics))
 	}
 
-	if m := metrics[0]; m.Value != want {
-		t.Fatalf("Expected value of %f, but got %f", want, m.Value)
+	if m := metrics[0]; m.Value == nil || *m.Value != want {
+		t.Fatalf("Expected value of %f, but got %v", want, m.Value)
 	}
 }
 
