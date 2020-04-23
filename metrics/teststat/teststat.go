@@ -58,11 +58,7 @@ func TestGauge(gauge metrics.Gauge, value func() []float64) error {
 	for i := 0; i < n; i++ {
 		f := float64(a[i])
 		gauge.Add(f)
-		if lw := len(want); lw > 0 {
-			want[lw-1] = want[lw-1] + f
-		} else {
-			want = append(want, want[len(want)-1]+f)
-		}
+		want = append(want, want[len(want)-1]+f)
 	}
 
 	have := value()
