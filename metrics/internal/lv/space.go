@@ -102,13 +102,13 @@ func (n *node) add(lvs LabelValues, delta float64) {
 	n.mtx.Lock()
 	defer n.mtx.Unlock()
 	if len(lvs) <= 0 {
-		var value float64
 		if len(n.observations) > 0 {
-			value = last(n.observations) + delta
+			// add delta to the last value
+			n.observations[len(n.observations)-1] = last(n.observations) + delta
 		} else {
-			value = delta
+			// add delta as value
+			n.observations = append(n.observations, delta)
 		}
-		n.observations = append(n.observations, value)
 		return
 	}
 	if len(lvs) < 2 {
