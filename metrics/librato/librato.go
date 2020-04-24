@@ -46,6 +46,7 @@ type Librato struct {
 	sums                  *lv.Space
 	percentiles           []float64 // percentiles to track
 	logger                log.Logger
+	debug                 bool
 	numConcurrentRequests int
 	maxBatchSize          int
 }
@@ -87,7 +88,7 @@ type Metric struct {
 	MeasureTime *int64   `json:"measure_time,omitempty"`
 	Name        string   `json:"name"`
 	Value       *float64 `json:"value,omitempty"`
-	Source      *string  `json:"string,omitempty"`
+	Source      *string  `json:"source,omitempty"`
 }
 
 type Option func(*Librato)
@@ -148,6 +149,13 @@ func WithHttpClient(c *http.Client) Option {
 	}
 }
 
+// WithDebug enables debug logging
+func WithDebug() Option {
+	return func(lb *Librato) {
+		lb.debug = true
+	}
+}
+
 // New returns a Librato object that may be used to create metrics.
 // Callers must ensure that regular calls to Send are performed, either
 // manually or with one of the helper methods.
@@ -165,6 +173,7 @@ func New(user, token string, options ...Option) *Librato {
 		percentiles:           []float64{0.50, 0.90, 0.95, 0.99},
 		numConcurrentRequests: maxConcurrentRequests,
 		maxBatchSize:          maxValuesInABatch,
+		debug:                 false,
 	}
 
 	for _, optFunc := range options {
@@ -176,8 +185,9 @@ func New(user, token string, options ...Option) *Librato {
 	return lb
 }
 
-// NewCounter returns a counter. Observations are aggregated and emitted once
-// per write invocation.
+// NewCounter returns a counter. Observations are aggregated as sum
+// and emitted once per write invocation.
+// See http://kb-docs-archive.librato.com/faq/glossary/whats_a_counter/
 func (lb *Librato) NewCounter(name string) metrics.Counter {
 	return &Counter{
 		name: name,
@@ -186,7 +196,10 @@ func (lb *Librato) NewCounter(name string) metrics.Counter {
 }
 
 // NewGauge returns an gauge, which will calculate count, sum, min, max
-// of observed data before sending it to librato
+// of observed data before sending it to librato.
+// Based on count/sum librato will calculate average value
+// this can be used to report average request payload size, etc.
+// See: http://kb-docs-archive.librato.com/faq/glossary/whats_a_gauge/
 func (lb *Librato) NewGauge(name string) metrics.Gauge {
 	return &Gauge{
 		name: name,
@@ -196,7 +209,11 @@ func (lb *Librato) NewGauge(name string) metrics.Gauge {
 }
 
 // NewSumGauge returns Gauge which will calculate sum of submitted values
-// before sending them to librato
+// before sending them to librato.
+// This can be used to monitor requests count, for example.
+// Every request will increment add 1 to the gauge value
+// and sum of all values will be reported to librato
+// See: http://kb-docs-archive.librato.com/faq/glossary/whats_a_gauge/
 func (lb *Librato) NewSumGauge(name string) metrics.Gauge {
 	return &Gauge{
 		name: name,
@@ -265,9 +282,9 @@ func (lb *Librato) Send() error {
 	}
 
 	lb.counters.Reset().Walk(func(name string, lvs lv.LabelValues, values []float64) bool {
-		sum := sum(values)
+		val := sum(values)
 		add(CounterPayload{
-			Value:  &sum,
+			Value:  &val,
 			Name:   name,
 			Source: getSourceFromLabels(lvs),
 		})
@@ -388,6 +405,10 @@ func (lb *Librato) postMetric(body *RequestPayload) error {
 }
 
 func (lb *Librato) makeRequest(data *bytes.Buffer, url string) error {
+	if lb.debug {
+		lb.logger.Log("during", "Send", "body", data)
+	}
+
 	req, err := http.NewRequest(http.MethodPost, url, data)
 	if nil != err {
 		return err
@@ -511,14 +532,26 @@ func (h *Histogram) Observe(value float64) {
 
 // GetSourceFromLabels fetches "source" from labels
 func getSourceFromLabels(lvs lv.LabelValues) *string {
-	for i, l := range lvs {
-		if l == "source" && i+1 < len(lvs) {
+	// if multiple "source" labels present in the lvs
+	// take the last one, this will allow overwritting of labels
+	// for example:
+	// > g := lb.NewGauge(name).With(librato.Source("test")...)
+	// > g.With(librato.Source("123")...).Add(v)
+	// > g.With(librato.Source("xxx")...).Add(v - 15)
+	for i := len(lvs) - 1; i >= 0; i-- {
+		if lvs[i] == "source" && i+1 < len(lvs) {
 			return &lvs[i+1]
 		}
 	}
+
 	return nil
 }
 
 func f64Ptr(v float64) *float64 {
 	return &v
+}
+
+// Source is a helper func to set "source" label
+func Source(source string) lv.LabelValues {
+	return lv.LabelValues{"source", source}
 }
